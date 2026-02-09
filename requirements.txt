@@ -1,0 +1,7 @@
+yfinance
+xgboost
+cvxpy
+joblib
+numpy
+pandas
+matplotlib
