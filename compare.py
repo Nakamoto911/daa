@@ -6,6 +6,7 @@ Includes regime shifts as a KEY tracked metric.
 """
 import pickle, numpy as np, pandas as pd
 from pathlib import Path
+from replication import DATA_VERSION, LAM_FLOOR
 
 def load(cat, name):
     p = Path("cache") / cat / f"{name}.pkl"
@@ -14,7 +15,8 @@ def load(cat, name):
 
 # ── Load all cached data ──────────────────────────────────────────────
 data = None
-for k in ["raw_v2_tr_1990-01-01_2024-01-01","raw_v2_tr_1990-01-01_2025-01-01",
+for k in [f"raw_{DATA_VERSION}_1990-01-01_2024-01-01", f"raw_{DATA_VERSION}_1990-01-01_2025-01-01",
+          "raw_v2_tr_1990-01-01_2024-01-01","raw_v2_tr_1990-01-01_2025-01-01",
           "raw_1990-01-01_2024-01-01","raw_1990-01-01_2025-01-01"]:
     data = load("data", k)
     if data: break
@@ -28,22 +30,24 @@ ASSETS = ["LargeCap","MidCap","SmallCap","EAFE","EM","REIT",
           "AggBond","Treasury","HighYield","Corporate","Commodity","Gold"]
 EQ = ASSETS[:6]; BD = ASSETS[6:]
 
+_pfx_list = [f"{DATA_VERSION}_", "v2_tr_", ""]
+
 jmxgb = {}; jm_only = {}
 for nm in ASSETS:
-    for pfx in ["v2_tr_", ""]:
+    for pfx in _pfx_list:
         r = load("models", f"jmxgb_{pfx}{nm}_{ts}_{te}")
         if r: jmxgb[nm] = r; break
-    for pfx in ["v2_tr_", ""]:
+    for pfx in _pfx_list:
         r = load("models", f"jm_{pfx}{nm}_{ts}_{te}")
         if r: jm_only[nm] = r; break
 bt_data = None
-for pfx in ["v2_tr_", ""]:
+for pfx in _pfx_list:
     bt_data = load("backtests", f"backtests_{pfx}{ts}_{te}")
     if bt_data: break
 
 # Load features from cache
 feat_data = None
-for pfx in ["v2_tr_", ""]:
+for pfx in _pfx_list:
     feat_data = load("data", f"features_{pfx}{ret_df.index[0].date()}_{ret_df.index[-1].date()}")
     if feat_data: break
 if feat_data:
@@ -332,6 +336,34 @@ for nm in ASSETS:
     sj = jm_only[nm]["metrics"].get("sharpe",0)
     sx = jmxgb[nm]["metrics"].get("sharpe",0)
     print(f"  {nm:12s} {sb:11.2f} {sj:10.2f} {sx:11.2f} {sj-sb:+10.2f} {sx-sb:+10.2f}")
+
+# ======================================================================
+# SECTION 5b: SHARPE DEFINITION DIAGNOSTIC (total-return vs excess-return)
+# ======================================================================
+print(f"\n{SEP}")
+print("  SECTION 5b: SHARPE DEFINITION DIAGNOSTIC")
+print(f"  Comparing total-return Sharpe (sr/vol) vs excess-return Sharpe ((sr-rf)/vol)")
+print(f"  Paper values may use one or the other; this helps identify which matches.")
+print(SEP)
+
+print(f"\n  {'Asset':12s} {'Paper':>7s} {'Sh(tot)':>8s} {'Sh(exc)':>8s} {'Δ(tot)':>8s} {'Δ(exc)':>8s} {'Better':>8s}")
+print(f"  {'-'*72}")
+for nm in ASSETS:
+    if nm not in jmxgb: continue
+    m = jmxgb[nm]["metrics"]
+    sh_tot = m.get("sharpe_total", 0)
+    sh_exc = m.get("sharpe", 0)
+    ps = P_XGB_S[nm]
+    d_tot = sh_tot - ps
+    d_exc = sh_exc - ps
+    better = "excess" if abs(d_exc) < abs(d_tot) else "total"
+    print(f"  {nm:12s} {ps:7.2f} {sh_tot:8.3f} {sh_exc:8.3f} {d_tot:+8.2f} {d_exc:+8.2f} {better:>8s}")
+
+n_exc_better = sum(1 for nm in ASSETS if nm in jmxgb and
+    abs(jmxgb[nm]["metrics"].get("sharpe", 0) - P_XGB_S[nm]) <
+    abs(jmxgb[nm]["metrics"].get("sharpe_total", 0) - P_XGB_S[nm]))
+print(f"\n  Excess-return Sharpe closer to paper: {n_exc_better}/{sum(1 for nm in ASSETS if nm in jmxgb)} assets")
+print("  (Primary metric 'sharpe' = excess-return; 'sharpe_total' = total-return)")
 
 # ======================================================================
 # SECTION 6: FULL TABLE 4 SIDE-BY-SIDE (ENHANCED with Return/Vol)

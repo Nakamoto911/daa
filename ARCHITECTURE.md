@@ -153,6 +153,7 @@ Lambda controls the tradeoff between fit quality and regime stability:
 - `λ = 0`: No penalty for switching → regimes change freely, many shifts
 - `λ = 100`: Extreme penalty → very few regime switches, sticky regimes
 - Paper's grid: `[0, 0.3, 1, 3, 7, 15, 40, 100]` — 8 values, roughly log-spaced
+- **Active grid** (with `LAM_FLOOR=10`): `[15, 40, 100]` — see Section 10.4 for rationale
 
 The optimal lambda is selected per-asset, per-update via Algorithm 2 (validation Sharpe).
 
@@ -293,10 +294,10 @@ The JM-only strategy uses regime labels directly (carry-forward) without XGBoost
 | Validation JM params | n_init=3, max_it=20 | n_init=1, max_it=10 (faster) |
 | Final JM params | n_init=3, max_it=20 | n_init=3, max_it=20 |
 | Smoothing | Asset-specific EWMA | None (binary labels) |
-| Training window (final) | `[ud-11yr, ud)` strictly OOS | `[ud-11yr, end_of_test]` includes OOS |
+| Training window (final) | `[ud-11yr, ud)` strictly OOS | `[ud-11yr, ud)` training only |
 | Caching | Sub-update cache + disk | None (recomputes each run) |
 
-**Note on data leakage in JM-only**: The final JM fit in `run_jm_only()` uses data up to the end of the test period (`fe=test_end`), not just up to the current update date. This is intentional: the "carry-forward" strategy labels today's regime using all available data, then uses today's label as tomorrow's forecast. This is how the paper describes the JM baseline — it has look-ahead bias by design, representing the theoretical best-case for JM without forecasting.
+**JM-only carry-forward strategy**: The JM fit in `run_jm_only()` uses training data only `[ud-11yr, ud)`, matching the JM-XGB approach. The last training label is broadcast as a constant forecast for the entire OOS period `[ud, next_update)`. This is a pure carry-forward: today's regime = the last regime detected at the end of training. No Viterbi is run on OOS data, avoiding look-ahead bias from the Viterbi backward pass.
 
 ---
 
@@ -484,7 +485,17 @@ Small differences in input data cascade through lambda selection:
 
 The JM-only strategy uses carry-forward labels without smoothing. Small differences in price levels during crisis periods (2008, 2020) can flip individual days' labels, and the carry-forward propagates these differences.
 
-### 10.4 Test Failures (5 of 112)
+### 10.4 Lambda Floor (Intentional Departure from Paper)
+
+**Decision**: A lambda floor (`LAM_FLOOR=10`) is applied to Algorithm 2's grid search, filtering the paper's grid `[0, 0.3, 1, 3, 7, 15, 40, 100]` down to `[15, 40, 100]`.
+
+**Why**: With Yahoo Finance data, Algorithm 2's validation Sharpe consistently selects low lambdas (0.3-7) because small daily return differences vs Bloomberg cascade through JM labels, XGB training, validation Sharpe, and lambda ranking. 15/34 validation races have a gap < 0.05 between the winning lambda and the runner-up, making the selection easily tippable by minor data differences.
+
+**Evidence**: With fixed lambda=50, LargeCap produces 42 shifts (paper: 46), Sharpe=0.801 (paper: 0.79), Bear=22.1% (paper: 20.9%). The paper authors' own `jumpmodels` example code uses `jump_penalty=50` as its default value. See `RESEARCH_LAMBDA.md` for the full investigation trail covering 15 diagnostic scripts.
+
+**Configuration**: `LAM_FLOOR` in `replication.py` (line 44). Set to 0 to restore the full paper grid. The `DATA_VERSION` string automatically incorporates the floor value to ensure cache separation between configurations.
+
+### 10.5 Test Failures (5 of 112)
 
 All are data-driven divergences, not code bugs:
 
@@ -518,8 +529,7 @@ Our `^IRX` gives 2.54%/yr average. The paper uses ~1.1%. This shifts every exces
 
 ### 11.3 Medium Priority: JM-Only Implementation
 
-The JM-only baseline shows the largest divergences (Sharpe +0.87 for LargeCap vs paper). Issues:
-- Current implementation includes OOS data in the final JM fit (`common<=te_`), which is intentional carry-forward but may not match the paper's exact procedure
+The JM-only baseline now uses pure carry-forward (training-only JM fit, last label broadcast to OOS). Remaining divergences are data-driven:
 - Validation uses reduced params (n_init=1, max_it=10) — paper may use full params
 - No sub-update caching — recomputes on every run
 

@@ -41,7 +41,9 @@ print("Imports OK")
 # ===========================================================================
 # CELL 2: Config
 # ===========================================================================
-DATA_VERSION = 'v2_tr'  # Increment when data sources change
+LAM_FLOOR = 10  # Lambda floor: min lambda for Algorithm 2 grid search (0 = disabled)
+                # See RESEARCH_LAMBDA.md for evidence supporting this choice.
+DATA_VERSION = f'v2_tr_lf{LAM_FLOOR}' if LAM_FLOOR > 0 else 'v2_tr'
 
 # V2 data sources: prioritized source chains per asset.
 # Each source: type (yahoo_index/yahoo_etf/yahoo_mf/fred_tr_index/fred_price),
@@ -124,8 +126,8 @@ ASSETS = list(ASSET_CONFIG.keys())
 EQ_RE = ['LargeCap','MidCap','SmallCap','EAFE','EM','REIT']
 BD_CM = ['AggBond','Treasury','HighYield','Corporate','Commodity','Gold']
 SMOOTH = {'LargeCap':8,'MidCap':8,'SmallCap':8,'EAFE':0,'EM':0,
-           'AggBond':8,'Treasury':8,'HighYield':0,'Corporate':2,
-           'REIT':8,'Commodity':4,'Gold':4}
+          'AggBond':8,'Treasury':8,'HighYield':0,'Corporate':2,
+          'REIT':8,'Commodity':4,'Gold':4}
 W6040 = {'LargeCap':.10,'MidCap':.05,'SmallCap':.05,'EAFE':.05,'EM':.05,
          'AggBond':.20,'Treasury':.10,'HighYield':.10,'Corporate':.10,
          'REIT':.10,'Commodity':.05,'Gold':.05}
@@ -452,7 +454,8 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
         # Paper: Algorithm 1 uses biannual sub-updates within validation window
         val_sub_updates = pd.date_range(val_start, val_end, freq='6MS')
 
-        best_sh, best_l = -np.inf, lam_grid[len(lam_grid) // 2]
+        best_sh, best_l = -np.inf, lam_grid[0]
+        any_lam_evaluated = False
 
         for lam in lam_grid:
             # Run Algorithm 1 for this lambda over validation window
@@ -460,10 +463,22 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
 
             for viu, vud in enumerate(val_sub_updates):
                 cache_key = (lam, vud)
+
+                # Compute OOS end date for this sub-update in this validation window
+                vfc_end = val_sub_updates[viu + 1] if viu + 1 < len(val_sub_updates) else pd.Timestamp(val_end)
+
+                # Cache stores fitted model (clf) or None; OOS predictions recomputed each time
+                # because vfc_end varies by validation window context
                 if cache_key in sub_cache:
-                    probs_s = sub_cache[cache_key]
-                    if probs_s is not None:
-                        val_all_prob = pd.concat([val_all_prob, probs_s])
+                    cached = sub_cache[cache_key]
+                    if cached is not None:
+                        clf_cached = cached
+                        oos_mask = (common >= vud) & (common < vfc_end)
+                        oos_pos = np.where(oos_mask)[0]
+                        if len(oos_pos) > 0:
+                            probs = clf_cached.predict_proba(xf_vals[oos_pos])[:, 1]
+                            val_all_prob = pd.concat([val_all_prob,
+                                pd.Series(probs, index=common[oos_pos])])
                     continue
 
                 vtr_s = vud - pd.DateOffset(years=11)
@@ -496,16 +511,16 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
                                          eval_metric='logloss', random_state=42, verbosity=0)
                 clf.fit(xf_tr, target)
 
-                vfc_end = val_sub_updates[viu + 1] if viu + 1 < len(val_sub_updates) else pd.Timestamp(val_end)
-                oos_mask = (common >= vud) & (common <= vfc_end)
+                # Cache the fitted model (training is expensive; OOS prediction is cheap)
+                sub_cache[cache_key] = clf
+
+                oos_mask = (common >= vud) & (common < vfc_end)
                 oos_pos = np.where(oos_mask)[0]
                 if len(oos_pos) == 0:
-                    sub_cache[cache_key] = None
                     continue
 
                 probs = clf.predict_proba(xf_vals[oos_pos])[:, 1]
                 probs_s = pd.Series(probs, index=common[oos_pos])
-                sub_cache[cache_key] = probs_s
                 val_all_prob = pd.concat([val_all_prob, probs_s])
 
             val_all_prob = val_all_prob[~val_all_prob.index.duplicated(keep='last')].sort_index()
@@ -522,11 +537,17 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
             pos = (fc_s == 0).astype(float)
             r = ar.reindex(pos.index); rfv = rf.reindex(pos.index).fillna(0)
             sr = pos * r + (1 - pos) * rfv - pos.diff().abs().fillna(0) * tc
-            vol = sr.std() * np.sqrt(252)
-            sh = sr.mean() * 252 / vol if vol > 0 else 0
+            exc_sr = sr - rfv
+            vol = exc_sr.std() * np.sqrt(252)
+            sh = exc_sr.mean() * 252 / vol if vol > 0 else 0
 
-            if sh > best_sh: best_sh, best_l = sh, lam
+            if sh > best_sh:
+                best_sh, best_l = sh, lam
+                any_lam_evaluated = True
 
+        if not any_lam_evaluated:
+            print(f"    WARNING: {nm} at {ud.strftime('%Y-%m')}: "
+                  f"no lambda passed validation, using default={best_l}")
         best_lams[ud] = best_l
 
         # --- Final model: refit on full training window with best lambda ---
@@ -555,7 +576,11 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
         clf.fit(xf_train, target)
 
         fc_end = updates[iu + 1] if iu + 1 < len(updates) else pd.Timestamp(test_end)
-        oos_mask = (common >= ud) & (common <= fc_end)
+        # Half-open [ud, fc_end) for interior windows; inclusive for last window
+        if iu + 1 < len(updates):
+            oos_mask = (common >= ud) & (common < fc_end)
+        else:
+            oos_mask = (common >= ud) & (common <= fc_end)
         oos_pos = np.where(oos_mask)[0]
         if len(oos_pos) == 0: continue
 
@@ -563,6 +588,9 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
         all_prob = pd.concat([all_prob, pd.Series(probs, index=common[oos_pos])])
 
     all_prob = all_prob[~all_prob.index.duplicated(keep='last')].sort_index()
+    all_prob_raw = all_prob.copy()
+
+    # Apply paper's hardcoded smoothing halflife (footnote 14, Table 4)
     if shl > 0 and len(all_prob) > 0:
         all_prob = all_prob.ewm(halflife=shl, min_periods=1).mean()
     fc = (all_prob >= 0.5).astype(int) if len(all_prob) > 0 else pd.Series(dtype=int)
@@ -572,20 +600,34 @@ def process_asset(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid,
         pos = (f_ == 0).astype(float); r = ar.reindex(ci); rfv = rf.reindex(ci).fillna(0)
         sr = pos * r + (1 - pos) * rfv - pos.diff().abs().fillna(0) * tc
         w = (1 + sr).cumprod(); pk = w.cummax()
-        vol = sr.std() * np.sqrt(252); sh = sr.mean() * 252 / vol if vol > 0 else 0
-        met = {'sharpe': sh, 'mdd': ((w - pk) / pk).min(), 'ann_ret': sr.mean() * 252,
-               'ann_vol': vol, 'n_shifts': int(pos.diff().abs().sum()),
+        vol_tot = sr.std() * np.sqrt(252); sh_tot = sr.mean() * 252 / vol_tot if vol_tot > 0 else 0
+        # Excess-return Sharpe (subtracts risk-free) — primary metric per paper
+        exc_sr = sr - rfv
+        vol_exc = exc_sr.std() * np.sqrt(252)
+        sh_exc = exc_sr.mean() * 252 / vol_exc if vol_exc > 0 else 0
+        met = {'sharpe': sh_exc, 'sharpe_total': sh_tot,
+               'mdd': ((w - pk) / pk).min(), 'ann_ret': sr.mean() * 252,
+               'ann_vol': vol_tot, 'n_shifts': int(pos.diff().abs().sum()),
                'pct_bear': (f_ == 1).mean() * 100}
     else:
         sr = pd.Series(dtype=float); w = sr; met = {}
 
     el = time.time() - t0
+    lam_vals = list(best_lams.values())
+    n_unique = len(set(lam_vals))
+    avg_lam = np.mean(lam_vals) if lam_vals else 0
+    min_lam = min(lam_vals) if lam_vals else 0
+    max_lam = max(lam_vals) if lam_vals else 0
     print(f"\r    {nm}: done ({el:.0f}s)" + " " * 30)
     print(f"  {nm:12s}: Sharpe={met.get('sharpe', 0):.3f}  "
           f"MDD={met.get('mdd', 0) * 100:.1f}%  Bear={met.get('pct_bear', 0):.0f}%  "
-          f"Shifts={met.get('n_shifts', 0)}  lam={best_l:.1f}  ({el:.1f}s)")
-    return nm, {'forecasts': fc, 'probs': all_prob, 'strat_ret': sr,
-                'metrics': met, 'wealth': w, 'best_lambdas': best_lams}
+          f"Shifts={met.get('n_shifts', 0)}  ({el:.1f}s)")
+    shl_note = f"  SMOOTH: HL={shl}"
+    print(f"    Lambda: avg={avg_lam:.1f}  range=[{min_lam:.1f}, {max_lam:.1f}]  "
+          f"unique={n_unique}/{len(lam_vals)}{shl_note}")
+    return nm, {'forecasts': fc, 'probs': all_prob, 'probs_raw': all_prob_raw,
+                'strat_ret': sr, 'metrics': met, 'wealth': w,
+                'best_lambdas': best_lams, 'smooth_hl': shl}
 
 
 def run_jm_only(nm, exc_df, ret_df, rf_daily, RF, lam_grid, test_start, test_end, tc=5e-4):
@@ -608,7 +650,8 @@ def run_jm_only(nm, exc_df, ret_df, rf_daily, RF, lam_grid, test_start, test_end
         val_start = ud - pd.DateOffset(years=5)
         val_end = ud
 
-        best_s, best_l = -np.inf, lam_grid[len(lam_grid) // 2]
+        best_s, best_l = -np.inf, lam_grid[0]
+        any_lam_evaluated = False
 
         for lam in lam_grid:
             # Run JM-only forecasts over validation window (biannual per paper)
@@ -617,7 +660,9 @@ def run_jm_only(nm, exc_df, ret_df, rf_daily, RF, lam_grid, test_start, test_end
 
             for viu, vud in enumerate(val_sub_updates):
                 vtr_s = vud - pd.DateOffset(years=11)
-                vtr_mask = (common >= vtr_s) & (common < vud)  # No data leak
+                vfc_end = val_sub_updates[viu + 1] if viu + 1 < len(val_sub_updates) else pd.Timestamp(val_end)
+                # Fit JM on training only [vtr_s, vud), carry forward last label
+                vtr_mask = (common >= vtr_s) & (common < vud)
                 vtr_idx = common[vtr_mask]
                 if len(vtr_idx) < 252: continue
 
@@ -630,10 +675,12 @@ def run_jm_only(nm, exc_df, ret_df, rf_daily, RF, lam_grid, test_start, test_end
                 jm = JM(lam=lam, n_init=1, max_it=10)
                 jm.fit(X_v_std)
                 labs = jm.labels(exc_v)
-                lab = pd.Series(labs, index=vtr_idx)
+                last_label = int(labs[-1])
 
-                vfc_end = val_sub_updates[viu + 1] if viu + 1 < len(val_sub_updates) else pd.Timestamp(val_end)
-                oos = lab[(lab.index >= vud) & (lab.index <= vfc_end)].shift(1).dropna()
+                oos_mask = (common >= vud) & (common < vfc_end)
+                oos_idx = common[oos_mask]
+                if len(oos_idx) == 0: continue
+                oos = pd.Series(last_label, index=oos_idx)
                 val_fc = pd.concat([val_fc, oos])
 
             val_fc = val_fc[~val_fc.index.duplicated(keep='last')].sort_index()
@@ -642,34 +689,49 @@ def run_jm_only(nm, exc_df, ret_df, rf_daily, RF, lam_grid, test_start, test_end
             ci = val_fc.index.intersection(ar.index)
             if len(ci) < 30: continue
             pos = (val_fc.reindex(ci) == 0).astype(float)
-            sr = pos * ar.reindex(ci) + (1 - pos) * rf_daily.reindex(ci).fillna(0)
-            v = sr.std() * np.sqrt(252)
-            s = sr.mean() * 252 / v if v > 0 else 0
-            if s > best_s: best_s, best_l = s, lam
+            rfv = rf_daily.reindex(ci).fillna(0)
+            sr = pos * ar.reindex(ci) + (1 - pos) * rfv - pos.diff().abs().fillna(0) * tc
+            exc_sr = sr - rfv
+            v = exc_sr.std() * np.sqrt(252)
+            s = exc_sr.mean() * 252 / v if v > 0 else 0
+            if s > best_s:
+                best_s, best_l = s, lam
+                any_lam_evaluated = True
 
+        if not any_lam_evaluated:
+            print(f"    WARNING: {nm} (JM-only) at {ud.strftime('%Y-%m')}: "
+                  f"no lambda passed validation, using default={best_l}")
         best_lams[ud] = best_l
 
-        # --- Final model: fit on data up to end of forecast period ---
-        # For JM-only, we fit on data including the OOS period (in-sample labeling)
-        # then use labels in the OOS period, shifted by 1 day (carry-forward)
+        # --- Final model: fit JM on TRAINING only, carry forward last label ---
+        # Paper's "carry-forward" = last training regime label broadcast to OOS.
+        # Viterbi is a smoothing algorithm (backward pass uses future data), so
+        # fitting on [train+OOS] would leak future information into OOS labels.
         tr_s = ud - pd.DateOffset(years=11)
         fe = updates[iu + 1] if iu + 1 < len(updates) else pd.Timestamp(test_end)
-        full_mask = (common >= tr_s) & (common <= fe)
-        full_idx = common[full_mask]
-        if len(full_idx) < 252: continue
+        tr_mask = (common >= tr_s) & (common < ud)
+        tr_idx = common[tr_mask]
+        if len(tr_idx) < 252: continue
 
-        full_pos = np.searchsorted(common, full_idx)
-        X_full = feat_vals[full_pos]
-        m_f, s_f = X_full.mean(0), X_full.std(0); s_f[s_f == 0] = 1
-        X_full_std = (X_full - m_f) / s_f
-        exc_full = exc_vals[full_pos]
+        tr_pos = np.searchsorted(common, tr_idx)
+        X_tr = feat_vals[tr_pos]
+        m_f, s_f = X_tr.mean(0), X_tr.std(0); s_f[s_f == 0] = 1
+        X_tr_std = (X_tr - m_f) / s_f
+        exc_tr = exc_vals[tr_pos]
 
         jm = JM(lam=best_l, n_init=3, max_it=20)
-        jm.fit(X_full_std)
-        labs = jm.labels(exc_full)
-        lab = pd.Series(labs, index=full_idx)
+        jm.fit(X_tr_std)
+        labs = jm.labels(exc_tr)
+        last_label = int(labs[-1])
 
-        oos = lab[(lab.index >= ud) & (lab.index <= fe)].shift(1).dropna()
+        # Half-open [ud, fe) for interior windows; inclusive for last window
+        if iu + 1 < len(updates):
+            oos_mask = (common >= ud) & (common < fe)
+        else:
+            oos_mask = (common >= ud) & (common <= fe)
+        oos_idx = common[oos_mask]
+        if len(oos_idx) == 0: continue
+        oos = pd.Series(last_label, index=oos_idx)
         all_fc = pd.concat([all_fc, oos])
 
     print(f"\r    {nm} (JM-only): done" + " " * 30)
@@ -680,13 +742,22 @@ def run_jm_only(nm, exc_df, ret_df, rf_daily, RF, lam_grid, test_start, test_end
         r = ar.reindex(ci); rfv = rf_daily.reindex(ci).fillna(0)
         sr = pos * r + (1 - pos) * rfv - pos.diff().abs().fillna(0) * tc
         w = (1 + sr).cumprod(); pk = w.cummax()
-        v = sr.std() * np.sqrt(252); sh = sr.mean() * 252 / v if v > 0 else 0
+        v_tot = sr.std() * np.sqrt(252); sh_tot = sr.mean() * 252 / v_tot if v_tot > 0 else 0
+        exc_sr = sr - rfv
+        vol_exc = exc_sr.std() * np.sqrt(252)
+        sh_exc = exc_sr.mean() * 252 / vol_exc if vol_exc > 0 else 0
         f_ = all_fc.reindex(ci)
-        met = {'sharpe': sh, 'mdd': ((w - pk) / pk).min(), 'ann_ret': sr.mean() * 252,
-               'ann_vol': v, 'n_shifts': int(pos.diff().abs().sum()),
+        met = {'sharpe': sh_exc, 'sharpe_total': sh_tot,
+               'mdd': ((w - pk) / pk).min(), 'ann_ret': sr.mean() * 252,
+               'ann_vol': v_tot, 'n_shifts': int(pos.diff().abs().sum()),
                'pct_bear': (f_ == 1).mean() * 100}
-        print(f"  {nm:12s}: Sharpe={sh:.3f}  Shifts={met['n_shifts']}  "
-              f"Bear={met['pct_bear']:.0f}%  lam={best_l:.1f}")
+        lam_vals = list(best_lams.values())
+        avg_lam = np.mean(lam_vals) if lam_vals else 0
+        n_unique = len(set(lam_vals))
+        print(f"  {nm:12s}: Sharpe={sh_exc:.3f}  Shifts={met['n_shifts']}  "
+              f"Bear={met['pct_bear']:.0f}%")
+        print(f"    Lambda: avg={avg_lam:.1f}  range=[{min(lam_vals):.1f}, {max(lam_vals):.1f}]  "
+              f"unique={n_unique}/{len(lam_vals)}")
     else:
         sr = pd.Series(dtype=float); w = sr; met = {}
         print(f"  {nm:12s}: no data")
@@ -718,6 +789,18 @@ def _run_jmxgb_all(assets, exc_df, ret_df, rf_daily, RF, MF, lam_grid, ts, te, u
             if use_cache:
                 _save_cache(res, 'models', f"jmxgb_{DATA_VERSION}_{nm}_{ts}_{te}")
             results[nm] = res
+    # Lambda selection summary
+    if results:
+        print(f"\n  Lambda Selection Summary (JM-XGB):")
+        print(f"    {'Asset':12s} {'Avg':>6s} {'Min':>6s} {'Max':>6s} {'#Unique':>8s} {'Varies?':>8s}")
+        for nm in assets:
+            if nm not in results: continue
+            lams = results[nm].get('best_lambdas', {})
+            if not lams: continue
+            vals = list(lams.values())
+            varies = "YES" if len(set(vals)) > 1 else "NO"
+            print(f"    {nm:12s} {np.mean(vals):6.1f} {min(vals):6.1f} {max(vals):6.1f} "
+                  f"{len(set(vals)):>3d}/{len(vals):<3d}  {varies:>8s}")
     return results
 
 def _run_jm_all(assets, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te, use_cache=True):
@@ -744,12 +827,44 @@ def _run_jm_all(assets, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te, use_cach
             results[nm] = res
     return results
 
+def diagnose_smooth(jmxgb, ret_df):
+    """Diagnostic: compare regime shifts with and without EWM smoothing."""
+    print(f"\n{'='*80}")
+    print("SMOOTH DIAGNOSTIC: Impact of EWM smoothing on regime shifts")
+    print(f"{'='*80}")
+    print(f"  {'Asset':12s} {'HL':>4s} {'Bear%':>7s} {'Shifts':>8s} {'Bear%(raw)':>11s} "
+          f"{'Shifts(raw)':>12s} {'ShiftDelta':>11s}")
+    print(f"  {'-'*75}")
+    for nm in ASSETS:
+        if nm not in jmxgb: continue
+        res = jmxgb[nm]
+        probs_raw = res.get('probs_raw', pd.Series())
+        if len(probs_raw) == 0: continue
+        shl = SMOOTH.get(nm, 4)
+        bear_s = res['metrics'].get('pct_bear', 0)
+        shifts_s = res['metrics'].get('n_shifts', 0)
+        # Raw (unsmoothed) metrics
+        fc_raw = (probs_raw >= 0.5).astype(int)
+        ci = fc_raw.index.intersection(ret_df[nm].dropna().index)
+        f_raw = fc_raw.reindex(ci)
+        bear_raw = (f_raw == 1).mean() * 100
+        shifts_raw = int(f_raw.diff().abs().sum())
+        delta = shifts_s - shifts_raw
+        print(f"  {nm:12s} {shl:4d} {bear_s:6.1f}% {shifts_s:8d}  {bear_raw:10.1f}% "
+              f"{shifts_raw:12d} {delta:+11d}")
+
 ts = '2007-01-01' if (ret_df.index[-1]-ret_df.index[0]).days/365>16 else \
      (ret_df.index[0]+pd.DateOffset(years=5)).strftime('%Y-%m-%d')
 te = ret_df.index[-1].strftime('%Y-%m-%d')
 LG = np.array([0., .3, 1., 3., 7., 15., 40., 100.])
+# Apply lambda floor — see RESEARCH_LAMBDA.md for evidence
+LG_FILTERED = LG[LG >= LAM_FLOOR] if LAM_FLOOR > 0 else LG
 
 print(f"\nTest period: {ts} -> {te}")
+if LAM_FLOOR > 0:
+    print(f"Lambda floor: {LAM_FLOOR} -- grid: {LG_FILTERED.tolist()} (paper: {LG.tolist()})")
+else:
+    print(f"Lambda grid: {LG.tolist()} (full paper grid, no floor)")
 
 def run_full_pipeline():
     """Run the full 12-asset pipeline (JM-XGB + JM-only + backtests + tables)."""
@@ -762,12 +877,13 @@ def run_full_pipeline():
     print("JM-XGB: All 12 assets (parallel + cached)")
     print("="*60)
     t0=time.time()
-    jmxgb = _run_jmxgb_all(ASSETS, exc_df, ret_df, rf_daily, RF, MF, LG, ts, te)
+    jmxgb = _run_jmxgb_all(ASSETS, exc_df, ret_df, rf_daily, RF, MF, LG_FILTERED, ts, te)
     print(f"JM-XGB total: {time.time()-t0:.0f}s")
+    diagnose_smooth(jmxgb, ret_df)
 
     print("\nJM-only pipeline (parallel + cached):")
     t0=time.time()
-    jm_only = _run_jm_all(ASSETS, exc_df, ret_df, rf_daily, RF, LG, ts, te)
+    jm_only = _run_jm_all(ASSETS, exc_df, ret_df, rf_daily, RF, LG_FILTERED, ts, te)
     print(f"JM-only total: {time.time()-t0:.0f}s")
 
     # CELL 10: TABLE 4

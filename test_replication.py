@@ -93,8 +93,10 @@ def data():
     """Load raw data from cache."""
     import pickle
     from pathlib import Path
-    # Try cache first (v2_tr total-return data preferred, then legacy)
-    for key in ["raw_v2_tr_1990-01-01_2024-01-01", "raw_v2_tr_1990-01-01_2025-01-01",
+    from replication import DATA_VERSION
+    # Try cache first (current DATA_VERSION preferred, then v2_tr, then legacy)
+    for key in [f"raw_{DATA_VERSION}_1990-01-01_2024-01-01", f"raw_{DATA_VERSION}_1990-01-01_2025-01-01",
+                "raw_v2_tr_1990-01-01_2024-01-01", "raw_v2_tr_1990-01-01_2025-01-01",
                 "raw_1990-01-01_2024-01-01", "raw_1990-01-01_2025-01-01"]:
         d = _load_pkl('data', key)
         if d is not None:
@@ -109,13 +111,14 @@ def data():
 @pytest.fixture(scope="session")
 def jmxgb(data):
     """Load JM-XGB results from cache."""
+    from replication import DATA_VERSION
     ret_df = data[0]
     ts = '2007-01-01' if (ret_df.index[-1]-ret_df.index[0]).days/365>16 else \
          (ret_df.index[0]+pd.DateOffset(years=5)).strftime('%Y-%m-%d')
     te = ret_df.index[-1].strftime('%Y-%m-%d')
     results = {}
     for nm in ASSETS:
-        for pfx in ["v2_tr_", ""]:
+        for pfx in [f"{DATA_VERSION}_", "v2_tr_", ""]:
             r = _load_pkl('models', f"jmxgb_{pfx}{nm}_{ts}_{te}")
             if r is not None:
                 results[nm] = r; break
@@ -127,13 +130,14 @@ def jmxgb(data):
 @pytest.fixture(scope="session")
 def jm_results(data):
     """Load JM-only results from cache."""
+    from replication import DATA_VERSION
     ret_df = data[0]
     ts = '2007-01-01' if (ret_df.index[-1]-ret_df.index[0]).days/365>16 else \
          (ret_df.index[0]+pd.DateOffset(years=5)).strftime('%Y-%m-%d')
     te = ret_df.index[-1].strftime('%Y-%m-%d')
     results = {}
     for nm in ASSETS:
-        for pfx in ["v2_tr_", ""]:
+        for pfx in [f"{DATA_VERSION}_", "v2_tr_", ""]:
             r = _load_pkl('models', f"jm_{pfx}{nm}_{ts}_{te}")
             if r is not None:
                 results[nm] = r; break
@@ -145,11 +149,12 @@ def jm_results(data):
 @pytest.fixture(scope="session")
 def backtests(data):
     """Load backtest results from cache."""
+    from replication import DATA_VERSION
     ret_df = data[0]
     ts = '2007-01-01' if (ret_df.index[-1]-ret_df.index[0]).days/365>16 else \
          (ret_df.index[0]+pd.DateOffset(years=5)).strftime('%Y-%m-%d')
     te = ret_df.index[-1].strftime('%Y-%m-%d')
-    for pfx in ["v2_tr_", ""]:
+    for pfx in [f"{DATA_VERSION}_", "v2_tr_", ""]:
         r = _load_pkl('backtests', f"backtests_{pfx}{ts}_{te}")
         if r is not None:
             return r
@@ -487,6 +492,53 @@ def test_best_lambdas_stored(jmxgb):
         assert len(lams) > 0, f"{nm}: no best_lambdas stored"
         for v in lams.values():
             assert 0 <= v <= 100, f"{nm}: lambda {v} out of range [0, 100]"
+
+
+@pytest.mark.parametrize("asset", ['LargeCap', 'AggBond', 'REIT'])
+def test_best_lambdas_vary_across_updates(jmxgb, asset):
+    """Lambda should show some variation across biannual updates,
+    proving it is dynamically optimized and not stuck at one value."""
+    if asset not in jmxgb:
+        pytest.skip(f"{asset} not in results")
+    lams = jmxgb[asset].get('best_lambdas', {})
+    if len(lams) < 5:
+        pytest.skip(f"{asset}: too few updates ({len(lams)})")
+    vals = list(lams.values())
+    n_unique = len(set(vals))
+    assert n_unique >= 2, \
+        f"{asset}: lambda never varies ({vals[0]:.1f} for all {len(vals)} updates). " \
+        f"Grid search may not be working."
+
+
+@pytest.mark.parametrize("asset", ['LargeCap', 'AggBond'])
+def test_best_lambdas_in_grid(jmxgb, asset):
+    """All selected lambdas should be values from the candidate grid."""
+    from replication import LG_FILTERED
+    if asset not in jmxgb:
+        pytest.skip(f"{asset} not in results")
+    grid_set = set(float(x) for x in LG_FILTERED)
+    lams = jmxgb[asset].get('best_lambdas', {})
+    for ud, lam in lams.items():
+        assert lam in grid_set, \
+            f"{asset} at {ud}: lambda={lam} not in grid {grid_set}"
+
+
+def test_lambda_not_always_same_across_all_assets(jmxgb):
+    """Different assets should have different lambda distributions,
+    confirming per-asset optimization."""
+    avg_lams = {}
+    for nm in ASSETS:
+        if nm not in jmxgb:
+            continue
+        lams = jmxgb[nm].get('best_lambdas', {})
+        if lams:
+            avg_lams[nm] = round(np.mean(list(lams.values())), 1)
+    if len(avg_lams) < 6:
+        pytest.skip("Not enough assets")
+    n_unique = len(set(avg_lams.values()))
+    assert n_unique >= 2, \
+        f"All {len(avg_lams)} assets have identical avg lambda={list(avg_lams.values())[0]}. " \
+        f"This is possible but suspicious."
 
 
 @pytest.mark.parametrize("asset,max_bear_pct", [
