@@ -46,33 +46,33 @@ Functions: `_save_cache(obj, category, name)`, `_load_cache(category, name, max_
 
 ### 2.1 Asset Universe
 
-12 asset classes spanning equities, real estate, bonds, and commodities:
+12 asset classes spanning equities, real estate, bonds, and commodities. **V2 total-return data** uses Yahoo Finance total-return index tickers, FRED bond total-return indices, and mutual fund adjusted close (which includes dividends/coupons) to approximate the paper's Bloomberg total-return data:
 
-| Group | Asset | ETF Ticker | Backfill Fund | Start |
-|-------|-------|-----------|--------------|-------|
-| Equity & RE | LargeCap | SPY | VFINX | 1990 |
-| | MidCap | IJH | VIMSX | 1990 |
-| | SmallCap | IWM | NAESX | 1990 |
-| | EAFE | EFA | VGTSX | 1990 |
-| | EM | EEM | VEIEX | 1990 |
-| | REIT | IYR | VGSIX | 1990 |
-| Bonds & Comm | AggBond | AGG | VBMFX | 1990 |
-| | Treasury | SPTL | VUSTX | 1990 |
-| | HighYield | HYG | VWEHX | 1990 |
-| | Corporate | SPBO | VFICX | 1990 |
-| | Commodity | DBC | — | 1990 |
-| | Gold | GLD | — | 1990 |
+| Group | Asset | Primary Source (V2) | Type | Start |
+|-------|-------|-------------------|------|-------|
+| Equity & RE | LargeCap | `^SP500TR` (Yahoo) | TR Index | 1990 |
+| | MidCap | `VIMSX` adj close (Yahoo) | MF adj close | 1998 |
+| | SmallCap | `^RUTTR` (Yahoo) + `NAESX` backfill | TR Index + MF | 1990 |
+| | EAFE | `VGTSX` adj close (Yahoo) | MF adj close | 1996 |
+| | EM | `VEIEX` adj close (Yahoo) | MF adj close | 1994 |
+| | REIT | `VGSIX` adj close (Yahoo) | MF adj close | 1996 |
+| Bonds & Comm | AggBond | `VBMFX` adj close (Yahoo) | MF adj close | 1990 |
+| | Treasury | `VUSTX` adj close (Yahoo) | MF adj close | 1990 |
+| | HighYield | `BAMLHYH0A0HYM2TRIV` (FRED) | ICE BofA TR | 1990 |
+| | Corporate | `BAMLCC0A0CMTRIV` (FRED) | ICE BofA TR | 1990 |
+| | Commodity | `DBC` adj close (Yahoo) | ETF adj close | 2006 |
+| | Gold | `GC=F` + `GLD` (Yahoo) | Futures + ETF | 2000 |
 
-**Paper uses Bloomberg total-return indices from 1991.** Our Yahoo data uses ETF price returns with mutual fund backfill before ETF inception. This is the primary source of divergence (see Section 10).
+**Paper uses Bloomberg total-return indices from 1991.** V2 data uses total-return indices and adjusted-close mutual funds that include dividends and coupon income, significantly reducing divergence vs. the paper. Key improvements: FRED bond indices add ~2-5%/yr coupon income, `^SP500TR` adds ~2%/yr dividends, VGSIX/VUSTX add dividend/coupon income for REIT/Treasury.
 
 ### 2.2 Data Construction
 
 `load_data(start='1990-01-01', end='2024-01-01')` at module-level execution:
 
-1. Download ETF and fund prices via `yfinance`
-2. For each asset: use fund returns before ETF inception, then ETF returns
+1. For each asset, walk `ASSET_CONFIG_V2` source chain: try Yahoo TR indices, FRED indices, or MF adj close, with ETF+MF fallback
+2. Splice segments chronologically (preferred source first, backfill sources for earlier dates)
 3. Build `ret_df` (daily returns), `exc_df` (excess returns = ret - rf)
-4. Risk-free rate from `^IRX` (3-month T-bill yield), converted to daily: `rf = (1 + IRX/100)^(1/252) - 1`
+4. Risk-free rate from FRED `DGS3MO` (3-month Treasury constant maturity, ~1.1%/yr over 2007-2023), fallback to Yahoo `^IRX`
 5. Macro data: `^IRX` (2Y yield), `^TNX` (10Y yield), `^VIX`
 
 **Key outputs available at module level**: `ret_df`, `exc_df`, `rf_daily`, `wealth_df`
@@ -464,13 +464,15 @@ run_full_pipeline():
 
 ### 10.3 Root Causes of Divergence
 
-**1. Data source (primary cause)**
+**1. Data source (largely addressed in V2)**
 
-The paper uses Bloomberg total-return indices that include dividends and coupons. Yahoo Finance provides price returns only. Impact:
-- **Bond assets** (AggBond, Treasury, HighYield, Corporate): Missing coupon income (~2-5%/yr) distorts excess return features, changing JM regime labels
-- **REIT**: Missing dividends (~3-4%/yr) makes VNQ returns look worse, inflating bear periods
-- **EAFE/EM**: ETFs launched mid-2000s; mutual fund backfill data quality differs substantially from Bloomberg direct index data
-- **Risk-free rate**: Our Yahoo `^IRX` gives 2.54%/yr average vs paper's ~1.1% from Bloomberg 3-month T-bill. This shifts all excess return calculations
+The paper uses Bloomberg total-return indices. V2 data uses total-return indices (Yahoo `^SP500TR`, `^RUTTR`), FRED bond TR indices (`BAMLHYH0A0HYM2TRIV`, `BAMLCC0A0CMTRIV`), and mutual fund adjusted close (VBMFX, VUSTX, VGSIX) which include dividends/coupons. Risk-free rate now from FRED `DGS3MO` (~1.1%/yr over test period, matching paper).
+
+Remaining gaps:
+- **EAFE/EM**: No free MSCI total-return index; mutual fund adj close (VGTSX from 1996, VEIEX from 1994) is a reasonable proxy but not exact
+- **MidCap**: VIMSX starts 1998 (S&P MidCap 400 launched 1991); ~7yr gap vs paper
+- **Commodity**: DBC ETF only from 2006 (underlying index from ~2003); no free historical data
+- **Gold**: GC=F futures from 2000; paper's LBMA data from 1991 — ~9yr gap
 
 **2. Lambda selection sensitivity**
 

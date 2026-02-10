@@ -31,6 +31,8 @@ import yfinance as yf, xgboost as xgb
 from joblib import Parallel, delayed
 try: import cvxpy as cp
 except: os.system("pip install -q cvxpy"); import cvxpy as cp
+import requests
+HAS_FRED = True  # uses requests (always available via yfinance dependency)
 
 plt.style.use('seaborn-v0_8-whitegrid')
 plt.rcParams.update({'figure.figsize':(12,6),'font.size':11,'font.family':'serif'})
@@ -39,14 +41,85 @@ print("Imports OK")
 # ===========================================================================
 # CELL 2: Config
 # ===========================================================================
-ASSET_CONFIG = {
-    'LargeCap':{'etf':'SPY','bf':'VFINX'},'MidCap':{'etf':'IJH','bf':'VIMSX'},
-    'SmallCap':{'etf':'IWM','bf':'NAESX'},'EAFE':{'etf':'EFA','bf':'VGTSX'},
-    'EM':{'etf':'EEM','bf':'VEIEX'},'AggBond':{'etf':'AGG','bf':'VBMFX'},
-    'Treasury':{'etf':'SPTL','bf':'VUSTX'},'HighYield':{'etf':'HYG','bf':'VWEHX'},
-    'Corporate':{'etf':'SPBO','bf':'VFICX'},'REIT':{'etf':'IYR','bf':'VGSIX'},
-    'Commodity':{'etf':'DBC','bf':None},'Gold':{'etf':'GLD','bf':None},
+DATA_VERSION = 'v2_tr'  # Increment when data sources change
+
+# V2 data sources: prioritized source chains per asset.
+# Each source: type (yahoo_index/yahoo_etf/yahoo_mf/fred_tr_index/fred_price),
+#              ticker, data_type (tr_index/adj_close/price — all use pct_change).
+# Fallback: old ETF+MF approach if primary sources fail.
+ASSET_CONFIG_V2 = {
+    'LargeCap': {
+        'sources': [{'type':'yahoo_index','ticker':'^SP500TR'}],
+        'fallback': {'etf':'SPY','bf':'VFINX'},
+    },
+    'MidCap': {
+        'sources': [
+            {'type':'yahoo_mf','ticker':'VIMSX'},   # adj close ~ TR, from ~1990s
+            {'type':'yahoo_etf','ticker':'IJH'},
+        ],
+        'fallback': {'etf':'IJH','bf':'VIMSX'},
+    },
+    'SmallCap': {
+        'sources': [
+            {'type':'yahoo_index','ticker':'^RUTTR'},  # Russell 2000 TR, from 1995
+            {'type':'yahoo_mf','ticker':'NAESX'},      # backfill pre-1995
+        ],
+        'fallback': {'etf':'IWM','bf':'NAESX'},
+    },
+    'EAFE': {
+        'sources': [
+            {'type':'yahoo_mf','ticker':'VGTSX'},
+            {'type':'yahoo_etf','ticker':'EFA'},
+        ],
+        'fallback': {'etf':'EFA','bf':'VGTSX'},
+    },
+    'EM': {
+        'sources': [
+            {'type':'yahoo_mf','ticker':'VEIEX'},
+            {'type':'yahoo_etf','ticker':'EEM'},
+        ],
+        'fallback': {'etf':'EEM','bf':'VEIEX'},
+    },
+    'AggBond': {
+        'sources': [{'type':'yahoo_mf','ticker':'VBMFX'}],
+        'fallback': {'etf':'AGG','bf':'VBMFX'},
+    },
+    'Treasury': {
+        'sources': [
+            {'type':'yahoo_mf','ticker':'VUSTX'},   # adj close ~ TR, from 1990
+        ],
+        'fallback': {'etf':'SPTL','bf':'VUSTX'},
+    },
+    'HighYield': {
+        'sources': [{'type':'fred_tr_index','ticker':'BAMLHYH0A0HYM2TRIV'}],
+        'fallback': {'etf':'HYG','bf':'VWEHX'},
+    },
+    'Corporate': {
+        'sources': [{'type':'fred_tr_index','ticker':'BAMLCC0A0CMTRIV'}],
+        'fallback': {'etf':'SPBO','bf':'VFICX'},
+    },
+    'REIT': {
+        'sources': [
+            {'type':'yahoo_mf','ticker':'VGSIX'},   # Vanguard REIT, adj close ~ TR, from 1996
+            {'type':'yahoo_etf','ticker':'IYR'},
+        ],
+        'fallback': {'etf':'IYR','bf':'VGSIX'},
+    },
+    'Commodity': {
+        'sources': [{'type':'yahoo_etf','ticker':'DBC'}],
+        'fallback': {'etf':'DBC','bf':None},
+    },
+    'Gold': {
+        'sources': [
+            {'type':'yahoo_etf','ticker':'GC=F'},   # gold futures, back to ~2000
+            {'type':'yahoo_etf','ticker':'GLD'},     # gold ETF, back to 2004
+        ],
+        'fallback': {'etf':'GLD','bf':None},
+    },
 }
+
+# Backward compatibility: derive old-style config from V2
+ASSET_CONFIG = {nm: cfg['fallback'] for nm, cfg in ASSET_CONFIG_V2.items()}
 ASSETS = list(ASSET_CONFIG.keys())
 EQ_RE = ['LargeCap','MidCap','SmallCap','EAFE','EM','REIT']
 BD_CM = ['AggBond','Treasury','HighYield','Corporate','Commodity','Gold']
@@ -115,32 +188,94 @@ def _dl(tk, start, end):
     try: return yf.Ticker(tk).history(start=start, end=end, auto_adjust=True)['Close'].dropna()
     except: return pd.Series(dtype=float)
 
+def _dl_fred(series_id, start, end):
+    """Download a series from FRED via public CSV endpoint (no API key needed)."""
+    try:
+        url = (f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+               f"?id={series_id}&cosd={start}&coed={end}")
+        df = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')
+        s = df.iloc[:, 0].dropna()
+        if len(s) > 0:
+            return s
+    except Exception as e:
+        print(f"  FRED download failed for {series_id}: {e}")
+    return pd.Series(dtype=float)
+
+def _download_asset(name, cfg, start, end):
+    """Download asset data using prioritized source chain with fallback.
+    Returns a pd.Series of daily returns.
+    """
+    segments = []
+    for src in cfg['sources']:
+        ticker = src['ticker']
+        src_type = src['type']
+        if src_type in ('yahoo_index', 'yahoo_etf', 'yahoo_mf'):
+            raw = _dl(ticker, start, end)
+        elif src_type in ('fred_tr_index', 'fred_price'):
+            raw = _dl_fred(ticker, start, end)
+        else:
+            raw = pd.Series(dtype=float)
+        if len(raw) > 0:
+            returns = raw.pct_change().dropna()
+            if len(returns) > 0:
+                segments.append(returns)
+                print(f"    {name:12s}: {src_type}({ticker}) -> {len(returns)} days "
+                      f"[{returns.index[0].date()} to {returns.index[-1].date()}]")
+
+    if not segments:
+        print(f"    {name:12s}: primary sources failed, using fallback ETF+MF")
+        fb = cfg['fallback']
+        ep = _dl(fb['etf'], start, end)
+        bp = _dl(fb['bf'], start, end) if fb['bf'] else pd.Series(dtype=float)
+        if len(ep) > 0 and len(bp) > 0:
+            bb = bp[bp.index < ep.index[0]]
+            r = pd.concat([bb.pct_change().dropna(), ep.pct_change().dropna()]) if len(bb) > 0 else ep.pct_change().dropna()
+            return r[~r.index.duplicated(keep='last')]
+        elif len(ep) > 0: return ep.pct_change().dropna()
+        elif len(bp) > 0: return bp.pct_change().dropna()
+        else: return pd.Series(dtype=float)
+
+    if len(segments) == 1:
+        return segments[0]
+
+    # Splice: first source preferred, later sources fill earlier dates
+    combined = segments[0]
+    for i in range(1, len(segments)):
+        prepend = segments[i][segments[i].index < combined.index[0]]
+        if len(prepend) > 0:
+            combined = pd.concat([prepend, combined])
+    return combined[~combined.index.duplicated(keep='last')].sort_index()
+
 def load_data(start='1990-01-01', end='2024-01-01', use_cache=True):
-    key = f"raw_{start}_{end}"
+    key = f"raw_{DATA_VERSION}_{start}_{end}"
     if use_cache:
         cached = _load_cache('data', key, max_hours=24)
         if cached is not None:
             print(f"Data loaded from cache ({key})")
             return cached
 
-    print(f"Downloading (yfinance {yf.__version__})...")
+    print(f"Downloading (yfinance {yf.__version__}, FRED {'available' if HAS_FRED else 'unavailable'})...")
     rets = {}
-    for nm, cfg in ASSET_CONFIG.items():
-        ep = _dl(cfg['etf'], start, end)
-        bp = _dl(cfg['bf'], start, end) if cfg['bf'] else pd.Series(dtype=float)
-        if len(ep)>0 and len(bp)>0:
-            bb = bp[bp.index < ep.index[0]]
-            r = pd.concat([bb.pct_change().dropna(), ep.pct_change().dropna()]) if len(bb)>0 else ep.pct_change().dropna()
-            r = r[~r.index.duplicated(keep='last')]
-        elif len(ep)>0: r = ep.pct_change().dropna()
-        elif len(bp)>0: r = bp.pct_change().dropna()
-        else: print(f"  {nm}: NO DATA"); continue
+    for nm, cfg in ASSET_CONFIG_V2.items():
+        r = _download_asset(nm, cfg, start, end)
+        if len(r) == 0:
+            print(f"  {nm}: NO DATA"); continue
         rets[nm] = r
         print(f"  {nm:12s}: {len(r):>5d} days  {r.index[0].date()}->{r.index[-1].date()}")
 
     ret_df = pd.DataFrame(rets).dropna(how='all').fillna(0.)
-    rfp = _dl('^IRX', start, end)
-    rf = ((1+rfp/100)**(1/252)-1).reindex(ret_df.index).ffill().fillna(0) if len(rfp)>0 else pd.Series(0.02/252, index=ret_df.index)
+
+    # Risk-free rate: prefer FRED DGS3MO (matches paper's 3-month CM rate)
+    rf_fred = _dl_fred('DGS3MO', start, end) if HAS_FRED else pd.Series(dtype=float)
+    if len(rf_fred) > 100:
+        rf = ((1 + rf_fred / 100) ** (1 / 252) - 1)
+        rf = rf.reindex(ret_df.index).ffill().fillna(0)
+        print(f"  RF: FRED DGS3MO ({rf.mean()*252*100:.2f}%/yr)")
+    else:
+        # Fallback to Yahoo ^IRX
+        rfp = _dl('^IRX', start, end)
+        rf = ((1+rfp/100)**(1/252)-1).reindex(ret_df.index).ffill().fillna(0) if len(rfp)>0 else pd.Series(0.02/252, index=ret_df.index)
+        print(f"  RF: Yahoo ^IRX fallback ({rf.mean()*252*100:.2f}%/yr)")
 
     macro = {}
     for sym,k in [('^IRX','T2Y'),('^TNX','T10Y'),('^VIX','VIX')]:
@@ -202,7 +337,7 @@ def macro_features(rdf, mdf):
     return pd.DataFrame(f).dropna(how='all')
 
 def _compute_features(exc_df, ret_df, macro_df, use_cache=True):
-    key = f"features_{exc_df.index[0].date()}_{exc_df.index[-1].date()}"
+    key = f"features_{DATA_VERSION}_{exc_df.index[0].date()}_{exc_df.index[-1].date()}"
     if use_cache:
         cached = _load_cache('data', key, max_hours=168)
         if cached is not None:
@@ -565,7 +700,7 @@ def _run_jmxgb_all(assets, exc_df, ret_df, rf_daily, RF, MF, lam_grid, ts, te, u
     results = {}; to_run = []
     for nm in assets:
         if nm not in exc_df: continue
-        key = f"jmxgb_{nm}_{ts}_{te}"
+        key = f"jmxgb_{DATA_VERSION}_{nm}_{ts}_{te}"
         if use_cache:
             c = _load_cache('models', key)
             if c is not None:
@@ -581,7 +716,7 @@ def _run_jmxgb_all(assets, exc_df, ret_df, rf_daily, RF, MF, lam_grid, ts, te, u
         )
         for nm, res in par:
             if use_cache:
-                _save_cache(res, 'models', f"jmxgb_{nm}_{ts}_{te}")
+                _save_cache(res, 'models', f"jmxgb_{DATA_VERSION}_{nm}_{ts}_{te}")
             results[nm] = res
     return results
 
@@ -589,7 +724,7 @@ def _run_jm_all(assets, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te, use_cach
     results = {}; to_run = []
     for nm in assets:
         if nm not in exc_df: continue
-        key = f"jm_{nm}_{ts}_{te}"
+        key = f"jm_{DATA_VERSION}_{nm}_{ts}_{te}"
         if use_cache:
             c = _load_cache('models', key)
             if c is not None:
@@ -605,7 +740,7 @@ def _run_jm_all(assets, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te, use_cach
         )
         for nm, res in par:
             if use_cache:
-                _save_cache(res, 'models', f"jm_{nm}_{ts}_{te}")
+                _save_cache(res, 'models', f"jm_{DATA_VERSION}_{nm}_{ts}_{te}")
             results[nm] = res
     return results
 
@@ -869,7 +1004,7 @@ def build_regime_return_forecasts(jmxgb, exc_df):
     return rfc, rrf
 
 def _run_backtests(ret_df, exc_df, rf_daily, rfc, rrf, ts, te, use_cache=True):
-    key = f"backtests_{ts}_{te}"
+    key = f"backtests_{DATA_VERSION}_{ts}_{te}"
     if use_cache:
         cached = _load_cache('backtests', key)
         if cached is not None:

@@ -14,7 +14,8 @@ def load(cat, name):
 
 # ── Load all cached data ──────────────────────────────────────────────
 data = None
-for k in ["raw_1990-01-01_2024-01-01","raw_1990-01-01_2025-01-01"]:
+for k in ["raw_v2_tr_1990-01-01_2024-01-01","raw_v2_tr_1990-01-01_2025-01-01",
+          "raw_1990-01-01_2024-01-01","raw_1990-01-01_2025-01-01"]:
     data = load("data", k)
     if data: break
 ret_df, exc_df, rf_daily, macro_df, wealth_df = data
@@ -29,16 +30,22 @@ EQ = ASSETS[:6]; BD = ASSETS[6:]
 
 jmxgb = {}; jm_only = {}
 for nm in ASSETS:
-    r = load("models", f"jmxgb_{nm}_{ts}_{te}")
-    if r: jmxgb[nm] = r
-    r = load("models", f"jm_{nm}_{ts}_{te}")
-    if r: jm_only[nm] = r
-bt_data = load("backtests", f"backtests_{ts}_{te}")
+    for pfx in ["v2_tr_", ""]:
+        r = load("models", f"jmxgb_{pfx}{nm}_{ts}_{te}")
+        if r: jmxgb[nm] = r; break
+    for pfx in ["v2_tr_", ""]:
+        r = load("models", f"jm_{pfx}{nm}_{ts}_{te}")
+        if r: jm_only[nm] = r; break
+bt_data = None
+for pfx in ["v2_tr_", ""]:
+    bt_data = load("backtests", f"backtests_{pfx}{ts}_{te}")
+    if bt_data: break
 
 # Load features from cache
 feat_data = None
-for k_f in [f"features_{ret_df.index[0].date()}_{ret_df.index[-1].date()}"]:
-    feat_data = load("data", k_f)
+for pfx in ["v2_tr_", ""]:
+    feat_data = load("data", f"features_{pfx}{ret_df.index[0].date()}_{ret_df.index[-1].date()}")
+    if feat_data: break
 if feat_data:
     RF_cached, MF_cached = feat_data
 else:

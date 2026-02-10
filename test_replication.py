@@ -93,8 +93,9 @@ def data():
     """Load raw data from cache."""
     import pickle
     from pathlib import Path
-    # Try cache first
-    for key in ["raw_1990-01-01_2024-01-01", "raw_1990-01-01_2025-01-01"]:
+    # Try cache first (v2_tr total-return data preferred, then legacy)
+    for key in ["raw_v2_tr_1990-01-01_2024-01-01", "raw_v2_tr_1990-01-01_2025-01-01",
+                "raw_1990-01-01_2024-01-01", "raw_1990-01-01_2025-01-01"]:
         d = _load_pkl('data', key)
         if d is not None:
             return d
@@ -114,9 +115,10 @@ def jmxgb(data):
     te = ret_df.index[-1].strftime('%Y-%m-%d')
     results = {}
     for nm in ASSETS:
-        r = _load_pkl('models', f"jmxgb_{nm}_{ts}_{te}")
-        if r is not None:
-            results[nm] = r
+        for pfx in ["v2_tr_", ""]:
+            r = _load_pkl('models', f"jmxgb_{pfx}{nm}_{ts}_{te}")
+            if r is not None:
+                results[nm] = r; break
     if not results:
         pytest.skip("No cached JM-XGB results. Run replication.py first.")
     return results
@@ -131,9 +133,10 @@ def jm_results(data):
     te = ret_df.index[-1].strftime('%Y-%m-%d')
     results = {}
     for nm in ASSETS:
-        r = _load_pkl('models', f"jm_{nm}_{ts}_{te}")
-        if r is not None:
-            results[nm] = r
+        for pfx in ["v2_tr_", ""]:
+            r = _load_pkl('models', f"jm_{pfx}{nm}_{ts}_{te}")
+            if r is not None:
+                results[nm] = r; break
     if not results:
         pytest.skip("No cached JM results. Run replication.py first.")
     return results
@@ -146,10 +149,11 @@ def backtests(data):
     ts = '2007-01-01' if (ret_df.index[-1]-ret_df.index[0]).days/365>16 else \
          (ret_df.index[0]+pd.DateOffset(years=5)).strftime('%Y-%m-%d')
     te = ret_df.index[-1].strftime('%Y-%m-%d')
-    r = _load_pkl('backtests', f"backtests_{ts}_{te}")
-    if r is None:
-        pytest.skip("No cached backtest results. Run replication.py first.")
-    return r
+    for pfx in ["v2_tr_", ""]:
+        r = _load_pkl('backtests', f"backtests_{pfx}{ts}_{te}")
+        if r is not None:
+            return r
+    pytest.skip("No cached backtest results. Run replication.py first.")
 
 
 @pytest.fixture(scope="session")
