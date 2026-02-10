@@ -43,7 +43,7 @@ print("Imports OK")
 # ===========================================================================
 LAM_FLOOR = 10  # Lambda floor: min lambda for Algorithm 2 grid search (0 = disabled)
                 # See RESEARCH_LAMBDA.md for evidence supporting this choice.
-DATA_VERSION = f'v2_tr_lf{LAM_FLOOR}' if LAM_FLOOR > 0 else 'v2_tr'
+DATA_VERSION = f'v3_fred_macro_lf{LAM_FLOOR}' if LAM_FLOOR > 0 else 'v3_fred_macro'
 
 # V2 data sources: prioritized source chains per asset.
 # Each source: type (yahoo_index/yahoo_etf/yahoo_mf/fred_tr_index/fred_price),
@@ -279,10 +279,33 @@ def load_data(start='1990-01-01', end='2024-01-01', use_cache=True):
         rf = ((1+rfp/100)**(1/252)-1).reindex(ret_df.index).ffill().fillna(0) if len(rfp)>0 else pd.Series(0.02/252, index=ret_df.index)
         print(f"  RF: Yahoo ^IRX fallback ({rf.mean()*252*100:.2f}%/yr)")
 
+    # Macro features: FRED primary sources per paper Table 3, Yahoo fallback
     macro = {}
-    for sym,k in [('^IRX','T2Y'),('^TNX','T10Y'),('^VIX','VIX')]:
-        s = _dl(sym, start, end)
-        if len(s)>0: macro[k] = s
+    # T2Y: paper says "US Treasury 2-Year Yield" → FRED DGS2 (2yr constant maturity)
+    # Previously used ^IRX (13-week T-bill) which is a 3-month rate — WRONG
+    t2y = _dl_fred('DGS2', start, end)
+    if len(t2y) > 100:
+        macro['T2Y'] = t2y
+        print(f"  Macro T2Y: FRED DGS2 ({len(t2y)} obs)")
+    else:
+        s = _dl('^IRX', start, end)
+        if len(s) > 0: macro['T2Y'] = s; print(f"  Macro T2Y: Yahoo ^IRX fallback ({len(s)} obs)")
+    # T10Y: FRED DGS10 (10yr constant maturity)
+    t10y = _dl_fred('DGS10', start, end)
+    if len(t10y) > 100:
+        macro['T10Y'] = t10y
+        print(f"  Macro T10Y: FRED DGS10 ({len(t10y)} obs)")
+    else:
+        s = _dl('^TNX', start, end)
+        if len(s) > 0: macro['T10Y'] = s; print(f"  Macro T10Y: Yahoo ^TNX fallback ({len(s)} obs)")
+    # VIX: FRED VIXCLS (CBOE VIX)
+    vix = _dl_fred('VIXCLS', start, end)
+    if len(vix) > 100:
+        macro['VIX'] = vix
+        print(f"  Macro VIX: FRED VIXCLS ({len(vix)} obs)")
+    else:
+        s = _dl('^VIX', start, end)
+        if len(s) > 0: macro['VIX'] = s; print(f"  Macro VIX: Yahoo ^VIX fallback ({len(s)} obs)")
     mdf = pd.DataFrame(macro).ffill().reindex(ret_df.index).ffill().bfill()
 
     exc_df = ret_df.subtract(rf, axis=0)

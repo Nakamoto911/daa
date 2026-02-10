@@ -73,7 +73,7 @@ Functions: `_save_cache(obj, category, name)`, `_load_cache(category, name, max_
 2. Splice segments chronologically (preferred source first, backfill sources for earlier dates)
 3. Build `ret_df` (daily returns), `exc_df` (excess returns = ret - rf)
 4. Risk-free rate from FRED `DGS3MO` (3-month Treasury constant maturity, ~1.1%/yr over 2007-2023), fallback to Yahoo `^IRX`
-5. Macro data: `^IRX` (2Y yield), `^TNX` (10Y yield), `^VIX`
+5. Macro data: FRED `DGS2` (2Y yield), FRED `DGS10` (10Y yield), FRED `VIXCLS` (VIX), with Yahoo fallback
 
 **Key outputs available at module level**: `ret_df`, `exc_df`, `rf_daily`, `wealth_df`
 

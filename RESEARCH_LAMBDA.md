@@ -236,3 +236,33 @@ A lambda floor of **10** is applied, filtering the grid from `[0, 0.3, 1, 3, 7, 
 
 ### Future Improvement
 If Bloomberg data becomes available, the lambda floor could be removed. The algorithm would then naturally select appropriate lambdas as the paper does. The floor is a pragmatic workaround for free-data limitations, not a permanent architectural choice.
+
+---
+
+## 7. Macro Feature Source Fix (v3)
+
+### Bug Found
+The macro features (paper Table 3) used **wrong Treasury yield sources**:
+- `T2Y` used Yahoo `^IRX` (13-week / 3-month T-bill rate) instead of FRED `DGS2` (2-year constant maturity)
+- This caused the yield curve slope (10Y - T2Y) to compute 10Y-3M instead of the paper's 10Y-2Y
+- Both `t2d` (interest rate trend) and `yc`/`ycd` (yield curve) features were wrong
+
+### Fix
+Switched all macro sources to FRED (with Yahoo fallback):
+- `T2Y`: FRED `DGS2` (was Yahoo `^IRX`)
+- `T10Y`: FRED `DGS10` (was Yahoo `^TNX`)
+- `VIX`: FRED `VIXCLS` (was Yahoo `^VIX`)
+
+### Impact on LargeCap (with LAM_FLOOR=10)
+
+| Metric | Before (v2) | After (v3) | Paper |
+|--------|------------|------------|-------|
+| Bear%  | 27.3%      | 24.8%      | 20.9% |
+| Shifts | 72         | 54         | 46    |
+| Sharpe | 0.649      | 0.776      | 0.79  |
+
+Sharpe improved from 0.649 to 0.776 (paper: 0.79, gap reduced from 0.14 to 0.01).
+Lambda selection now strongly favors lambda=40 (28/34 updates), matching paper expectations.
+
+### LAM_FLOOR still needed
+With `LAM_FLOOR=0` and FRED macros: Shifts=112, Bear=32.7%. The full grid still allows low lambdas to win in validation for some periods due to Yahoo vs Bloomberg return differences. The floor remains necessary.
