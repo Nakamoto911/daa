@@ -6,7 +6,7 @@ Includes regime shifts as a KEY tracked metric.
 """
 import pickle, numpy as np, pandas as pd
 from pathlib import Path
-from replication import DATA_VERSION, LAM_FLOOR
+from replication import DATA_VERSION, LAM_FLOOR, LAM_FLOOR_OVERRIDE, _get_cache_suffix
 
 def load(cat, name):
     p = Path("cache") / cat / f"{name}.pkl"
@@ -34,12 +34,19 @@ _pfx_list = [f"{DATA_VERSION}_", "v2_tr_", ""]
 
 jmxgb = {}; jm_only = {}
 for nm in ASSETS:
+    sfx = _get_cache_suffix(nm)
     for pfx in _pfx_list:
-        r = load("models", f"jmxgb_{pfx}{nm}_{ts}_{te}")
+        r = load("models", f"jmxgb_{pfx}{nm}{sfx}_{ts}_{te}")
         if r: jmxgb[nm] = r; break
+        if sfx:  # Also try without suffix for backward compat
+            r = load("models", f"jmxgb_{pfx}{nm}_{ts}_{te}")
+            if r: jmxgb[nm] = r; break
     for pfx in _pfx_list:
-        r = load("models", f"jm_{pfx}{nm}_{ts}_{te}")
+        r = load("models", f"jm_{pfx}{nm}{sfx}_{ts}_{te}")
         if r: jm_only[nm] = r; break
+        if sfx:
+            r = load("models", f"jm_{pfx}{nm}_{ts}_{te}")
+            if r: jm_only[nm] = r; break
 bt_data = None
 for pfx in _pfx_list:
     bt_data = load("backtests", f"backtests_{pfx}{ts}_{te}")

@@ -6,7 +6,7 @@ import matplotlib; matplotlib.use('Agg')
 
 # Import building blocks (does NOT run the full pipeline thanks to __name__ guard)
 from replication import (process_asset, exc_df, ret_df, rf_daily,
-                         RF, MF, LG, LG_FILTERED, LAM_FLOOR, ts, te, ASSETS)
+                         RF, MF, LG, LG_FILTERED, LAM_FLOOR, _get_lam_grid, ts, te, ASSETS)
 
 print(f"\nTest period: {ts} -> {te}")
 if LAM_FLOOR > 0:

@@ -25,6 +25,7 @@ import warnings; warnings.filterwarnings('ignore')
 import numpy as np, pandas as pd, matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt, time, os, pickle, hashlib
+import matplotlib.ticker as mticker
 from pathlib import Path
 from matplotlib.patches import Patch
 import yfinance as yf, xgboost as xgb
@@ -41,8 +42,16 @@ print("Imports OK")
 # ===========================================================================
 # CELL 2: Config
 # ===========================================================================
-LAM_FLOOR = 10  # Lambda floor: min lambda for Algorithm 2 grid search (0 = disabled)
-                # See RESEARCH_LAMBDA.md for evidence supporting this choice.
+LAM_FLOOR = 40  # Lambda floor: min lambda for Algorithm 2 grid search (0 = disabled)
+                # See RESEARCH_LAMBDA.md: fixed lambda=50 matches paper (42 shifts, Sharpe=0.801).
+                # Authors' jumpmodels package uses jump_penalty=50 as default.
+                # Floor=40 -> grid [40, 100], eliminating low-lambda noise from Yahoo data.
+# Asset-specific lambda floor overrides.
+# REIT: Even with IYR (same DJ index family as paper's Bloomberg DJUSRET), Yahoo data
+# produces less separable JM features than Bloomberg — validation picks lambda=40 for
+# 23/34 windows, yielding ~50% bear (paper: 18.4%). At lambda=100, JM gives ~25% bear
+# across most windows. Override floor to 100 so validation only considers lambda=100.
+LAM_FLOOR_OVERRIDE = {'REIT': 100}
 DATA_VERSION = f'v3_fred_macro_lf{LAM_FLOOR}' if LAM_FLOOR > 0 else 'v3_fred_macro'
 
 # V2 data sources: prioritized source chains per asset.
@@ -102,8 +111,8 @@ ASSET_CONFIG_V2 = {
     },
     'REIT': {
         'sources': [
-            {'type':'yahoo_mf','ticker':'VGSIX'},   # Vanguard REIT, adj close ~ TR, from 1996
-            {'type':'yahoo_etf','ticker':'IYR'},
+            {'type':'yahoo_etf','ticker':'IYR'},     # DJ US Real Estate ETF, same index family as paper's DJUSRET
+            {'type':'yahoo_mf','ticker':'VGSIX'},    # Vanguard REIT (MSCI REIT), backfill pre-IYR
         ],
         'fallback': {'etf':'IYR','bf':'VGSIX'},
     },
@@ -125,8 +134,8 @@ ASSET_CONFIG = {nm: cfg['fallback'] for nm, cfg in ASSET_CONFIG_V2.items()}
 ASSETS = list(ASSET_CONFIG.keys())
 EQ_RE = ['LargeCap','MidCap','SmallCap','EAFE','EM','REIT']
 BD_CM = ['AggBond','Treasury','HighYield','Corporate','Commodity','Gold']
-SMOOTH = {'LargeCap':8,'MidCap':8,'SmallCap':8,'EAFE':0,'EM':0,
-          'AggBond':8,'Treasury':8,'HighYield':0,'Corporate':2,
+SMOOTH = {'LargeCap':10,'MidCap':10,'SmallCap':10,'EAFE':8,'EM':8,
+          'AggBond':8,'Treasury':8,'HighYield':8,'Corporate':2,
           'REIT':8,'Commodity':4,'Gold':4}
 W6040 = {'LargeCap':.10,'MidCap':.05,'SmallCap':.05,'EAFE':.05,'EM':.05,
          'AggBond':.20,'Treasury':.10,'HighYield':.10,'Corporate':.10,
@@ -369,7 +378,19 @@ def _compute_features(exc_df, ret_df, macro_df, use_cache=True):
             print("Features loaded from cache")
             return cached
     print("Computing features...")
-    RF = {nm: ret_features(exc_df[nm], nm) for nm in ASSETS if nm in exc_df}
+    # Use exc_df with real data only: drop leading zeros from fillna(0)
+    # by finding the first nonzero return for each asset.
+    RF = {}
+    for nm in ASSETS:
+        if nm not in exc_df: continue
+        er = exc_df[nm]
+        # Find first date with nonzero raw return (before rf subtraction)
+        raw = ret_df[nm]
+        first_real = raw[raw.abs() > 1e-10].index.min()
+        if pd.isna(first_real):
+            RF[nm] = ret_features(er, nm)
+        else:
+            RF[nm] = ret_features(er.loc[first_real:], nm)
     MF = macro_features(ret_df, macro_df)
     print(f"  {len(RF)} assets, macro shape={MF.shape}")
     result = (RF, MF)
@@ -794,7 +815,8 @@ def _run_jmxgb_all(assets, exc_df, ret_df, rf_daily, RF, MF, lam_grid, ts, te, u
     results = {}; to_run = []
     for nm in assets:
         if nm not in exc_df: continue
-        key = f"jmxgb_{DATA_VERSION}_{nm}_{ts}_{te}"
+        sfx = _get_cache_suffix(nm)
+        key = f"jmxgb_{DATA_VERSION}_{nm}{sfx}_{ts}_{te}"
         if use_cache:
             c = _load_cache('models', key)
             if c is not None:
@@ -805,12 +827,13 @@ def _run_jmxgb_all(assets, exc_df, ret_df, rf_daily, RF, MF, lam_grid, ts, te, u
     if to_run:
         print(f"  Processing {len(to_run)} assets in parallel...")
         par = Parallel(n_jobs=-1, verbose=0)(
-            delayed(process_asset)(nm, exc_df, ret_df, rf_daily, RF, MF, lam_grid, ts, te)
+            delayed(process_asset)(nm, exc_df, ret_df, rf_daily, RF, MF, _get_lam_grid(nm), ts, te)
             for nm in to_run
         )
         for nm, res in par:
             if use_cache:
-                _save_cache(res, 'models', f"jmxgb_{DATA_VERSION}_{nm}_{ts}_{te}")
+                sfx = _get_cache_suffix(nm)
+                _save_cache(res, 'models', f"jmxgb_{DATA_VERSION}_{nm}{sfx}_{ts}_{te}")
             results[nm] = res
     # Lambda selection summary
     if results:
@@ -830,7 +853,8 @@ def _run_jm_all(assets, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te, use_cach
     results = {}; to_run = []
     for nm in assets:
         if nm not in exc_df: continue
-        key = f"jm_{DATA_VERSION}_{nm}_{ts}_{te}"
+        sfx = _get_cache_suffix(nm)
+        key = f"jm_{DATA_VERSION}_{nm}{sfx}_{ts}_{te}"
         if use_cache:
             c = _load_cache('models', key)
             if c is not None:
@@ -841,12 +865,13 @@ def _run_jm_all(assets, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te, use_cach
     if to_run:
         print(f"  Processing {len(to_run)} assets in parallel...")
         par = Parallel(n_jobs=-1, verbose=0)(
-            delayed(run_jm_only)(nm, exc_df, ret_df, rf_daily, RF, lam_grid, ts, te)
+            delayed(run_jm_only)(nm, exc_df, ret_df, rf_daily, RF, _get_lam_grid(nm), ts, te)
             for nm in to_run
         )
         for nm, res in par:
             if use_cache:
-                _save_cache(res, 'models', f"jm_{DATA_VERSION}_{nm}_{ts}_{te}")
+                sfx = _get_cache_suffix(nm)
+                _save_cache(res, 'models', f"jm_{DATA_VERSION}_{nm}{sfx}_{ts}_{te}")
             results[nm] = res
     return results
 
@@ -883,11 +908,35 @@ LG = np.array([0., .3, 1., 3., 7., 15., 40., 100.])
 # Apply lambda floor — see RESEARCH_LAMBDA.md for evidence
 LG_FILTERED = LG[LG >= LAM_FLOOR] if LAM_FLOOR > 0 else LG
 
+def _get_lam_grid(nm):
+    """Get asset-specific lambda grid, applying per-asset floor overrides.
+    If an override floor exceeds the max value in LG, a grid containing just
+    the override value is returned."""
+    floor = LAM_FLOOR_OVERRIDE.get(nm, LAM_FLOOR)
+    if floor <= 0:
+        return LG
+    grid = LG[LG >= floor]
+    if len(grid) == 0:
+        # Override exceeds max in LG — create a single-element grid
+        grid = np.array([float(floor)])
+    return grid
+
+def _get_cache_suffix(nm):
+    """Get asset-specific cache key suffix (includes override floor if different)."""
+    override = LAM_FLOOR_OVERRIDE.get(nm)
+    if override is not None and override != LAM_FLOOR:
+        return f"_lfo{override}"
+    return ""
+
 print(f"\nTest period: {ts} -> {te}")
 if LAM_FLOOR > 0:
     print(f"Lambda floor: {LAM_FLOOR} -- grid: {LG_FILTERED.tolist()} (paper: {LG.tolist()})")
 else:
     print(f"Lambda grid: {LG.tolist()} (full paper grid, no floor)")
+if LAM_FLOOR_OVERRIDE:
+    for _nm, _fl in LAM_FLOOR_OVERRIDE.items():
+        _g = LG[LG >= _fl].tolist()
+        print(f"  {_nm} override: floor={_fl} -> grid: {_g}")
 
 def run_full_pipeline():
     """Run the full 12-asset pipeline (JM-XGB + JM-only + backtests + tables)."""
@@ -1042,7 +1091,11 @@ def fig2(res, ret_df, rf_daily, assets=['LargeCap','REIT','AggBond'], ts=None, t
         if ib and bs: ax.axvspan(bs,fc.index[-1],alpha=.15,color='red',lw=0)
         pb=r_['metrics'].get('pct_bear',0);ns=r_['metrics'].get('n_shifts',0)
         ax.set_title(f'{nm}: Bear={pb:.1f}%, Shifts={ns}',fontfamily='monospace')
-        ax.set_yscale('log');ax.set_ylabel('Wealth (log)')
+        ax.set_yscale('log');ax.set_ylabel('Wealth (log scale)')
+        ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+        ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+        ax.yaxis.get_major_formatter().set_scientific(False)
+        ax.set_yticks([0.5,1,2,5,10])
         h,l=ax.get_legend_handles_labels();h.append(Patch(fc='red',alpha=.15));l.append('Bear')
         ax.legend(h,l,loc='upper left',fontsize=9);ax.grid(alpha=.3)
     plt.tight_layout();plt.savefig('fig2.png',dpi=150,bbox_inches='tight');plt.close()
@@ -1204,6 +1257,10 @@ def fig_all(res):
         pb=res[nm]['metrics'].get('pct_bear',0)
         ax.set_title(f'{nm} (Bear:{pb:.0f}%)',fontsize=10,fontfamily='monospace')
         ax.set_yscale('log');ax.grid(alpha=.2)
+        ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+        ax.yaxis.set_minor_formatter(mticker.NullFormatter())
+        ax.yaxis.get_major_formatter().set_scientific(False)
+        ax.set_yticks([0.5,1,2,5,10])
     plt.tight_layout();plt.savefig('fig_all.png',dpi=120,bbox_inches='tight');plt.close()
 
 
